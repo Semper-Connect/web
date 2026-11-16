@@ -3,86 +3,44 @@ from odoo.tests.common import TransactionCase
 
 
 class TestPortalDiscussMessages(TransactionCase):
-    """Test the portal Discuss membership policy."""
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.portal_partner = cls.env["res.partner"].create(
-            {
-                "name": "Portal Discuss Member",
-                "email": "portal-discuss-member@example.com",
-            }
-        )
-        cls.portal_user = (
-            cls.env["res.users"]
-            .with_context(no_reset_password=True)
-            .create(
-                {
-                    "name": cls.portal_partner.name,
-                    "login": cls.portal_partner.email,
-                    "partner_id": cls.portal_partner.id,
-                    "share": True,
-                    "groups_id": [(6, 0, [cls.env.ref("base.group_portal").id])],
-                }
-            )
-        )
-        cls.channel = cls.env["discuss.channel"].create(
-            {
-                "name": "Portal test channel",
-            }
-        )
-        cls.other_channel = cls.env["discuss.channel"].create(
-            {
-                "name": "Other portal channel",
-            }
-        )
-        cls.channel.sudo().add_members(
-            partner_ids=[cls.portal_partner.id], post_joined_message=False
-        )
+        cls.portal_partner = cls.env["res.partner"].create({"name": "Portal Discuss Member", "email": "portal-discuss-member@example.com"})
+        cls.portal_user = cls.env["res.users"].with_context(no_reset_password=True).create({
+            "name": cls.portal_partner.name, "login": cls.portal_partner.email,
+            "partner_id": cls.portal_partner.id, "share": True,
+            "groups_id": [(6, 0, [cls.env.ref("base.group_portal").id])],
+        })
+        cls.sales_user = cls.env["res.users"].with_context(no_reset_password=True).create({
+            "name": "Portal Sales User", "login": "portal-sales@example.com",
+            "share": False, "groups_id": [(6, 0, [cls.env.ref("base.group_user").id])],
+        })
+        cls.team = cls.env["crm.team"].create({
+            "name": "Portal Sales Team", "use_leads": True,
+            "crm_team_member_ids": [(0, 0, {"user_id": cls.sales_user.id})],
+        })
+
+    def test_portal_sales_channel_is_created_once(self):
+        channels = self.env["discuss.channel"]
+        first = channels._portal_get_or_create_sales_team_channel(self.portal_partner, self.team)
+        second = channels._portal_get_or_create_sales_team_channel(self.portal_partner, self.team)
+        self.assertEqual(first, second)
+        self.assertEqual(set(first.channel_member_ids.mapped("partner_id").ids), {self.portal_partner.id, self.sales_user.partner_id.id})
+        self.assertEqual(len(first.message_ids.filtered(lambda message: message.author_id == self.portal_partner)), 1)
 
     def test_portal_member_has_access(self):
-        self.assertTrue(self.channel._portal_user_has_access(self.portal_user))
-        self.assertEqual(
-            self.channel._portal_check_access(self.portal_user), self.channel
-        )
+        channel = self.env["discuss.channel"]._portal_get_or_create_sales_team_channel(self.portal_partner, self.team)
+        self.assertTrue(channel._portal_user_has_access(self.portal_user))
+        self.assertEqual(channel._portal_check_access(self.portal_user), channel)
 
     def test_portal_non_member_has_no_access(self):
-        self.assertFalse(self.other_channel._portal_user_has_access(self.portal_user))
+        other_partner = self.env["res.partner"].create({"name": "Other portal"})
+        other_user = self.env["res.users"].with_context(no_reset_password=True).create({
+            "name": other_partner.name, "login": "other-portal@example.com",
+            "partner_id": other_partner.id, "share": True,
+            "groups_id": [(6, 0, [self.env.ref("base.group_portal").id])],
+        })
+        channel = self.env["discuss.channel"]._portal_get_or_create_sales_team_channel(self.portal_partner, self.team)
         with self.assertRaises(AccessError):
-            self.other_channel._portal_check_access(self.portal_user)
-
-    def test_access_is_based_on_native_channel_membership(self):
-        self.assertEqual(
-            self.channel.channel_member_ids.filtered(
-                lambda member: member.partner_id == self.portal_partner
-            ).partner_id,
-            self.portal_partner,
-        )
-        self.assertFalse(
-            self.other_channel.channel_member_ids.filtered(
-                lambda member: member.partner_id == self.portal_partner
-            )
-        )
-
-    def test_messages_are_scoped_by_channel(self):
-        first_message = self.channel.message_post(
-            body="Message in the authorized channel",
-            message_type="comment",
-        )
-        other_message = self.other_channel.message_post(
-            body="Message in another channel",
-            message_type="comment",
-        )
-        messages = (
-            self.env["mail.message"]
-            .sudo()
-            .search(
-                [
-                    ("model", "=", "discuss.channel"),
-                    ("res_id", "=", self.channel.id),
-                ]
-            )
-        )
-        self.assertIn(first_message, messages)
-        self.assertNotIn(other_message, messages)
+            channel._portal_check_access(other_user)

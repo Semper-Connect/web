@@ -1,30 +1,30 @@
-from werkzeug.exceptions import NotFound
-
-from odoo import http
+from odoo import _, http
 from odoo.http import request
-
 from odoo.addons.mail.controllers.discuss.public_page import PublicPageController
 from odoo.addons.mail.models.discuss.mail_guest import add_guest_to_context
 from odoo.addons.mail.tools.discuss import Store
+from werkzeug.exceptions import NotFound
 
 
 class PortalDiscussController(PublicPageController):
-    """Expose native Discuss channels to portal members."""
+    """Expose native Discuss channels and controlled team conversations."""
 
     def _get_portal_channels(self, user=None):
         user = user or request.env.user
         if not user._is_portal():
             return request.env["discuss.channel"]
-        return (
-            request.env["discuss.channel"]
-            .sudo()
-            .search(
-                [
-                    ("active", "=", True),
-                    ("channel_member_ids.partner_id", "=", user.partner_id.id),
-                ]
-            )
-        )
+        return request.env["discuss.channel"].sudo().search([
+            ("active", "=", True),
+            ("channel_member_ids.partner_id", "=", user.partner_id.id),
+        ])
+
+    def _get_sales_teams(self):
+        return request.env["crm.team"].sudo().search([
+            ("active", "=", True),
+            "|", ("use_leads", "=", True), ("use_opportunities", "=", True),
+            ("crm_team_member_ids.user_id.active", "=", True),
+            ("crm_team_member_ids.user_id.share", "=", False),
+        ], order="sequence, name")
 
     def _get_selected_channel(self, channels, channel_id):
         if not channel_id:
@@ -36,14 +36,11 @@ class PortalDiscussController(PublicPageController):
         return channels.filtered(lambda channel: channel.id == channel_id)[:1]
 
     def _prepare_discuss_data(self, selected_channel):
-        """Build the native public Discuss store for the selected channel."""
-        return Store(
-            {
-                "companyName": request.env.company.name,
-                "inPublicPage": True,
-                "discuss_public_thread": Store.one(selected_channel),
-            }
-        ).get_result()
+        return Store({
+            "companyName": request.env.company.name,
+            "inPublicPage": True,
+            "discuss_public_thread": Store.one(selected_channel),
+        }).get_result()
 
     @http.route("/my/discuss", type="http", auth="user", website=True)
     def portal_discuss(self, channel_id=None, **kwargs):
@@ -52,31 +49,38 @@ class PortalDiscussController(PublicPageController):
             return request.redirect("/odoo/action-mail.action_discuss")
         if not user._is_portal():
             raise NotFound()
-
         channels = self._get_portal_channels(user)
         channels._portal_check_access(user)
         selected_channel = self._get_selected_channel(channels, channel_id)
-        data = self._prepare_discuss_data(selected_channel)
-        return request.render(
-            "web_portal_discuss.portal_discuss",
-            {
-                "channels": channels,
-                "selected_channel": selected_channel,
-                "discuss_data": data,
-                "session_info": request.env["ir.http"].session_info(),
-            },
-        )
+        return request.render("web_portal_discuss.portal_discuss", {
+            "channels": channels,
+            "selected_channel": selected_channel,
+            "sales_teams": self._get_sales_teams(),
+            "discuss_data": self._prepare_discuss_data(selected_channel),
+            "session_info": request.env["ir.http"].session_info(),
+        })
 
-    @http.route(
-        "/discuss/channel/<int:channel_id>",
-        type="http",
-        auth="public",
-        website=True,
-    )
+    @http.route("/my/discuss/create", type="http", auth="user", methods=["POST"], website=True)
+    def portal_create_discuss(self, team_id=None, **kwargs):
+        user = request.env.user
+        if not user._is_portal():
+            raise NotFound()
+        try:
+            team = self._get_sales_teams().filtered(lambda item: item.id == int(team_id))[:1]
+        except (TypeError, ValueError):
+            team = request.env["crm.team"]
+        if not team:
+            return request.redirect("/my/discuss")
+        channel = request.env["discuss.channel"]._portal_get_or_create_sales_team_channel(
+            user.partner_id, team
+        )
+        if not channel:
+            return request.redirect("/my/discuss")
+        return request.redirect(f"/my/discuss?channel_id={channel.id}")
+
+    @http.route("/discuss/channel/<int:channel_id>", type="http", auth="public", website=True)
     @add_guest_to_context
-    def discuss_channel(
-        self, channel_id, *, highlight_message_id=None, portal_embed=False
-    ):
+    def discuss_channel(self, channel_id, *, highlight_message_id=None, portal_embed=False):
         user = request.env.user
         if user._is_portal():
             channel = request.env["discuss.channel"].browse(channel_id).exists()
@@ -85,6 +89,4 @@ class PortalDiscussController(PublicPageController):
             channel._portal_check_access(user)
             if not portal_embed:
                 return request.redirect(f"/my/discuss?channel_id={channel.id}")
-        return super().discuss_channel(
-            channel_id, highlight_message_id=highlight_message_id
-        )
+        return super().discuss_channel(channel_id, highlight_message_id=highlight_message_id)
